@@ -2,6 +2,12 @@ import { NextResponse } from "next/server";
 import { getProviderConnections } from "@/lib/localDb";
 import { backfillCodexEmails } from "@/lib/oauth/providers";
 import { USAGE_APIKEY_PROVIDERS, USAGE_SUPPORTED_PROVIDERS } from "@/shared/constants/providers";
+import { getAntigravityQuotaCache } from "@/sse/services/antigravityQuota";
+import {
+  buildProviderConnectionStatus,
+  maskSensitiveAccountLabel,
+  sanitizeProviderError,
+} from "@/lib/providerConnectionStatus";
 
 const SAFE_FIELDS = [
   "id", "provider", "authType", "name", "email", "displayName",
@@ -23,16 +29,15 @@ const SAFE_PSD_FIELDS = [
 const DEFAULT_PAGE_SIZE = 20;
 const MAX_PAGE_SIZE = 500;
 
-function maskName(name) {
-  if (typeof name !== "string" || name.length <= 16) return name;
-  if (/[a-zA-Z0-9_-]{32,}/.test(name)) return `${name.slice(0, 8)}***`;
-  return name;
-}
-
-function sanitize(c) {
+function sanitize(c, quotaCache) {
   const safe = {};
   for (const f of SAFE_FIELDS) if (c[f] !== undefined) safe[f] = c[f];
-  if (safe.name) safe.name = maskName(safe.name);
+  safe.name = maskSensitiveAccountLabel(safe.name);
+  safe.displayName = maskSensitiveAccountLabel(safe.displayName);
+  safe.lastError = sanitizeProviderError(safe.lastError);
+  safe.health = buildProviderConnectionStatus(c, {
+    quotaSnapshot: c.provider === "antigravity" ? quotaCache.get(c.id) : null,
+  });
   if (c.providerSpecificData) {
     const psd = {};
     for (const f of SAFE_PSD_FIELDS) {
@@ -104,7 +109,10 @@ export async function GET(request) {
     const totalPages = Math.max(1, Math.ceil(total / pageSize));
     const currentPage = Math.min(page, totalPages);
     const offset = (currentPage - 1) * pageSize;
-    const pageConnections = sortedConnections.slice(offset, offset + pageSize).map(sanitize);
+    const quotaCache = getAntigravityQuotaCache();
+    const pageConnections = sortedConnections
+      .slice(offset, offset + pageSize)
+      .map((connection) => sanitize(connection, quotaCache));
 
     return NextResponse.json({
       connections: pageConnections,

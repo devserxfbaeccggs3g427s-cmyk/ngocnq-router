@@ -10,6 +10,7 @@ import { APIKEY_PROVIDERS } from "@/shared/constants/config";
 import { AI_PROVIDERS, FREE_TIER_PROVIDERS, WEB_COOKIE_PROVIDERS, isOpenAICompatibleProvider, isAnthropicCompatibleProvider, isCustomEmbeddingProvider } from "@/shared/constants/providers";
 import { normalizeProviderId, normalizeProviderSpecificData } from "@/lib/providerNormalization";
 import { toProviderConnectionResponse } from "@/lib/providerConnectionResponse";
+import { getAntigravityQuotaCache } from "@/sse/services/antigravityQuota";
 
 export const dynamic = "force-dynamic";
 
@@ -61,15 +62,20 @@ export async function GET() {
       }
     } catch { }
 
-    // Hide sensitive fields, enrich name for compatible providers
+    // Hide sensitive fields, enrich name for compatible providers, and attach
+    // only already-cached quota state. Listing providers must never trigger an
+    // upstream request (including a paid inference health check).
+    const antigravityQuotaCache = getAntigravityQuotaCache();
     const safeConnections = connections.map(c => {
       const isCompatible = isOpenAICompatibleProvider(c.provider) || isAnthropicCompatibleProvider(c.provider);
       const name = isCompatible
         ? (c.name || nodeNameMap[c.provider] || c.providerSpecificData?.nodeName || c.provider)
         : c.name;
       return {
-        ...toProviderConnectionResponse(c),
-        name,
+        ...toProviderConnectionResponse(
+          { ...c, name },
+          { quotaSnapshot: c.provider === "antigravity" ? antigravityQuotaCache.get(c.id) : null },
+        ),
       };
     });
 

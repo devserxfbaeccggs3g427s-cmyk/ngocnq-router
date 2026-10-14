@@ -155,12 +155,16 @@ describe("chatCore provider session forwarding", () => {
       fileURLToPath(new URL("../../open-sse/handlers/chatCore.js", import.meta.url)),
       "utf8",
     );
-    const calls = [...source.matchAll(/executor\.execute\(\{([\s\S]*?)\}\)/g)].map((match) => match[1]);
+    // Phase A factored both dispatches through one traced helper. What must stay
+    // true is that the dispatch forwards the session seed and client tool, and
+    // that BOTH the initial attempt and the post-refresh retry go through it —
+    // a raw call-site count would only pin the current factoring.
+    const dispatch = source.match(/executor\.execute\(\{([\s\S]*?)\n\s*\}\)/)?.[1];
+    expect(dispatch).toBeTruthy();
+    expect(dispatch).toMatch(/providerSessionId:\s*sessionSeed/);
+    expect(dispatch).toMatch(/\bclientTool\b/);
 
-    expect(calls).toHaveLength(2);
-    for (const call of calls) {
-      expect(call).toMatch(/providerSessionId:\s*sessionSeed/);
-      expect(call).toMatch(/\bclientTool\b/);
-    }
+    const tracedDispatches = [...source.matchAll(/await executeTraced\(\)/g)];
+    expect(tracedDispatches).toHaveLength(2);
   });
 });

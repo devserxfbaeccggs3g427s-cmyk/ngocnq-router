@@ -6,6 +6,7 @@ import {
   deleteProviderConnection,
 } from "@/models";
 import { toProviderConnectionResponse, usesAwsCredentialForm } from "@/lib/providerConnectionResponse";
+import { getAntigravityQuotaCache } from "@/sse/services/antigravityQuota";
 
 function normalizeProxyConfig(body = {}) {
   const hasAnyProxyField =
@@ -70,7 +71,12 @@ export async function GET(request, { params }) {
       return NextResponse.json({ error: "Connection not found" }, { status: 404 });
     }
 
-    return NextResponse.json({ connection: toProviderConnectionResponse(connection) });
+    const quotaSnapshot = connection.provider === "antigravity"
+      ? getAntigravityQuotaCache().get(connection.id)
+      : null;
+    return NextResponse.json({
+      connection: toProviderConnectionResponse(connection, { quotaSnapshot }),
+    });
   } catch (error) {
     console.log("Error fetching connection:", error);
     return NextResponse.json({ error: "Failed to fetch connection" }, { status: 500 });
@@ -161,7 +167,12 @@ export async function PUT(request, { params }) {
 
     const updated = await updateProviderConnection(id, updateData);
 
-    return NextResponse.json({ connection: toProviderConnectionResponse(updated) });
+    const quotaSnapshot = updated.provider === "antigravity"
+      ? getAntigravityQuotaCache().get(updated.id)
+      : null;
+    return NextResponse.json({
+      connection: toProviderConnectionResponse(updated, { quotaSnapshot }),
+    });
   } catch (error) {
     console.log("Error updating connection:", error);
     return NextResponse.json({ error: "Failed to update connection" }, { status: 500 });

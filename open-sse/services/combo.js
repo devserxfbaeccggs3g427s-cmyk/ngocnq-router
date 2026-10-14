@@ -6,6 +6,7 @@ import { checkFallbackError, formatRetryAfter } from "./accountFallback.js";
 import { unavailableResponse } from "../utils/error.js";
 import { getCapabilitiesForModel } from "../providers/capabilities.js";
 import { extractTextContent } from "../translator/formats/gemini.js";
+import { HTTP_STATUS } from "../config/runtimeConfig.js";
 
 // Hard capabilities = input modalities; missing one drops request data (e.g. image
 // stripped). Must be prioritized. Soft (e.g. search) only degrades a feature.
@@ -79,6 +80,149 @@ export function reorderByCapabilities(models, required) {
     .map((m, i) => ({ m, i, t: tierOf(m) }))
     .sort((a, b) => a.t - b.t || a.i - b.i)
     .map((x) => x.m);
+}
+
+/**
+ * Smart routing (Phase A, SR-01..04).
+ *
+ * Deliberately conservative: it only reorders when EVERY candidate that survived
+ * the hard capability filter has enough recent, priced evidence. If any candidate
+ * is under-sampled, stale, or mostly unpriced, the combo's own order is kept —
+ * an unknown price must never be rewarded as if it were free, and a thin sample
+ * must never outrank a well-known one.
+ */
+
+/** Bumped whenever the scoring below changes, so stored explanations stay readable. */
+export const SMART_ROUTING_POLICY_VERSION = "smart-routing-v1";
+
+export const SMART_ROUTING_WEIGHTS = Object.freeze({
+  health: 0.40,
+  p95: 0.30,
+  cost: 0.20,
+  successRate: 0.10,
+});
+
+export const SMART_ROUTING_ELIGIBILITY = Object.freeze({
+  minSamples: 100,                 // terminal attempts in the 30-day window
+  maxStalenessMs: 7 * 86400000,    // lastSeenAt must be newer than 7 days
+  minPricedCoverage: 0.8,          // ≥80% of attempts priced AND token-counted
+  // Normalization bounds. Fixed, not learned: they bound the score's sensitivity
+  // to outliers without pretending to know this workload's real latency/price.
+  p95CeilingMs: 10000,
+  costCeilingUsdPer1k: 5,
+});
+
+/** Hard-filter failure: no candidate can accept the request's input modality. */
+export class UnsupportedModalityError extends Error {
+  constructor(missing) {
+    super(`no model satisfies required hard capabilities: ${missing.join(",")}`);
+    this.name = "UnsupportedModalityError";
+    this.code = "unsupported_modality";
+    this.missing = missing;
+  }
+}
+
+const capsFor = (model) => {
+  const slash = typeof model === "string" ? model.indexOf("/") : -1;
+  const provider = slash > 0 ? model.slice(0, slash) : "";
+  const id = slash > 0 ? model.slice(slash + 1) : model;
+  return getCapabilitiesForModel(provider, id);
+};
+
+/**
+ * Drop members that cannot accept the request's input modality.
+ *
+ * reorderByCapabilities() only floats capable models to the FRONT — the
+ * incapable ones stay in the fallback chain, so a vision request whose first
+ * choice failed would be retried on a text-only model, which strips the image
+ * and bills for a wrong answer. Removing them is safe whenever at least one
+ * member can serve the request; when none can, the list is left intact so
+ * existing behaviour (and the caller's own error) is unchanged.
+ *
+ * @returns {{models: string[], dropped: string[]}}
+ */
+export function applyModalityFilter(models, requiredCapabilities) {
+  const hard = [...new Set(requiredCapabilities || [])].filter((c) => HARD_CAPS.has(c));
+  if (hard.length === 0) return { models, dropped: [] };
+  const capable = models.filter((m) => hard.every((c) => capsFor(m)[c] === true));
+  if (capable.length === 0) return { models, dropped: [] };
+  return { models: capable, dropped: models.filter((m) => !capable.includes(m)) };
+}
+
+const clamp01 = (n) => (Number.isFinite(n) ? Math.min(1, Math.max(0, n)) : null);
+
+/**
+ * Is one candidate's evidence strong enough to rank on?
+ * @returns {string|null} null when eligible, otherwise the disqualifying reason.
+ */
+export function smartRankingIneligibility(metric) {
+  if (!metric) return "no_metrics";
+  if (!(Number(metric.sampleCount) >= SMART_ROUTING_ELIGIBILITY.minSamples)) return "insufficient_samples";
+  const seen = metric.lastSeenAt ? new Date(metric.lastSeenAt).getTime() : NaN;
+  if (!Number.isFinite(seen) || Date.now() - seen > SMART_ROUTING_ELIGIBILITY.maxStalenessMs) return "stale_metrics";
+  if (clamp01(metric.health) === null) return "missing_health";
+  if (!Number.isFinite(metric.p95)) return "missing_latency";
+  if (clamp01(metric.successRate) === null) return "missing_success_rate";
+  if (!Number.isFinite(metric.costPer1k)) return "missing_cost";
+  const coverage = Number.isFinite(metric.pricedCoverage)
+    ? metric.pricedCoverage
+    : (Number(metric.pricedSampleCount) || 0) / Math.max(1, Number(metric.sampleCount) || 1);
+  if (coverage < SMART_ROUTING_ELIGIBILITY.minPricedCoverage) return "insufficient_priced_coverage";
+  return null;
+}
+
+/**
+ * Hard-filter then (only if every survivor is eligible) rank by weighted score.
+ *
+ * Hard filter is a safety property, not a preference: a model that cannot read
+ * an image the user just sent must be dropped outright. Soft capabilities
+ * (e.g. "search") never filter — they only surface through successRate.
+ *
+ * @param {object} opts
+ * @param {string[]} opts.models - combo members, in combo order
+ * @param {Set<string>|string[]} [opts.requiredCapabilities]
+ * @param {object} opts.metrics - keyed by "provider/model" (see getRoutingMetrics)
+ * @returns {string[]} the models to try, in dispatch order
+ * @throws {UnsupportedModalityError} when no member can accept the request
+ */
+export function rankSmartComboCandidates({ models, requiredCapabilities, metrics = {} }) {
+  if (!Array.isArray(models) || models.length === 0) {
+    throw new Error("models array is required and must not be empty");
+  }
+  const required = new Set(requiredCapabilities || []);
+  const hard = [...required].filter((c) => HARD_CAPS.has(c));
+
+  const eligible = [];
+  const missing = new Set();
+  for (const model of models) {
+    const caps = capsFor(model);
+    const unsupported = hard.filter((c) => caps[c] !== true);
+    if (unsupported.length === 0) eligible.push(model);
+    else for (const c of unsupported) missing.add(c);
+  }
+  if (eligible.length === 0) throw new UnsupportedModalityError([...missing]);
+
+  // Conservative gate: one weak candidate is enough to keep the combo's order.
+  for (const model of eligible) {
+    const reason = smartRankingIneligibility(metrics[model]);
+    if (reason) return eligible;
+  }
+
+  const score = (metric) => {
+    const health = clamp01(metric.health);
+    const latency = clamp01(1 - metric.p95 / SMART_ROUTING_ELIGIBILITY.p95CeilingMs);
+    const cost = clamp01(1 - metric.costPer1k / SMART_ROUTING_ELIGIBILITY.costCeilingUsdPer1k);
+    const success = clamp01(metric.successRate);
+    return SMART_ROUTING_WEIGHTS.health * health
+      + SMART_ROUTING_WEIGHTS.p95 * latency
+      + SMART_ROUTING_WEIGHTS.cost * cost
+      + SMART_ROUTING_WEIGHTS.successRate * success;
+  };
+
+  return eligible
+    .map((model, i) => ({ model, i, score: score(metrics[model]) }))
+    .sort((a, b) => b.score - a.score || a.i - b.i)
+    .map((x) => x.model);
 }
 
 /**
@@ -273,26 +417,77 @@ export function getComboModelsFromData(modelStr, combosData) {
  * @param {Function} options.handleSingleModel - Function to handle single model: (body, modelStr) => Promise<Response>
  * @param {Object} options.log - Logger object
  * @param {string} [options.comboName] - Name of the combo (for round-robin tracking)
- * @param {string} [options.comboStrategy] - Strategy: "fallback" or "round-robin"
+ * @param {string} [options.comboStrategy] - Strategy: "fallback", "round-robin", or "smart"
  * @param {number|string} [options.comboStickyLimit=1] - Requests per combo model before switching
+ * @param {boolean} [options.autoSwitch=true] - Auto-reorder by capabilities
+ * @param {Object} [options.routingMetrics] - Routing metrics from traceRepo (health, p95, successRate, costPer1k, sampleCount)
+ * @param {Set<string>} [options.requiredCapabilities] - Required capabilities (pre-detected)
  * @returns {Promise<Response>}
  */
-export async function handleComboChat({ body, models, handleSingleModel, log, comboName, comboStrategy, comboStickyLimit = 1, autoSwitch = true }) {
+export async function handleComboChat({ body, models, handleSingleModel, log, comboName, comboStrategy, comboStickyLimit = 1, autoSwitch = true, routingMetrics = null, requiredCapabilities = null }) {
   // Apply rotation strategy if enabled
   let rotatedModels = getRotatedModels(models, comboName, comboStrategy, comboStickyLimit);
 
-  // Auto-switch: float models that satisfy the request's required capabilities to the front.
-  if (autoSwitch) {
+  // For "smart" strategy: reorder by routing metrics (health, latency, cost)
+  // This overrides autoSwitch since smart routing includes capability awareness
+  if (comboStrategy === "smart" && routingMetrics) {
+    const required = requiredCapabilities || detectRequiredCapabilities(body);
+    try {
+      rotatedModels = rankSmartComboCandidates({
+        models: rotatedModels,
+        requiredCapabilities: required,
+        metrics: routingMetrics
+      });
+      log.info("COMBO", `Smart routing: reordered to [${rotatedModels.join(", ")}]`);
+    } catch (e) {
+      // A hard-capability miss is NOT a ranking problem — there is simply no
+      // member that can read what the user sent. Fail with an explicit code
+      // BEFORE any upstream call instead of quietly trying text-only models
+      // that would strip the image and bill for a wrong answer.
+      if (e?.code === "unsupported_modality") {
+        log.warn("COMBO", `Smart routing: ${e.message}; refusing to dispatch`);
+        return new Response(JSON.stringify({
+          error: {
+            message: e.message,
+            type: "invalid_request_error",
+            code: "unsupported_modality",
+          },
+        }), {
+          status: HTTP_STATUS.BAD_REQUEST,
+          headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+        });
+      }
+      // Anything else (missing metrics, unexpected shape) keeps combo order.
+      log.warn("COMBO", `Smart routing: ${e.message}; using combo order`);
+      if (autoSwitch) {
+        const required = detectRequiredCapabilities(body);
+        if (required.size > 0) {
+          const { models: filtered, dropped } = applyModalityFilter(rotatedModels, required);
+          if (dropped.length > 0) {
+            log.info("COMBO", `auto-switch for [${[...required].join(",")}] drops [${dropped.join(", ")}]`);
+          }
+          rotatedModels = reorderByCapabilities(filtered, required);
+        }
+      }
+    }
+  } else if (autoSwitch) {
+    // Auto-switch. Dropping incapable members is a safety fix that applies even
+    // with smart routing off — it changes no ranking, only which models are
+    // allowed to be retried with data they cannot read.
     const required = detectRequiredCapabilities(body);
     if (required.size > 0) {
-      const reordered = reorderByCapabilities(rotatedModels, required);
-      if (reordered[0] !== rotatedModels[0]) {
+      const { models: filtered, dropped } = applyModalityFilter      (rotatedModels, required);
+      if (dropped.length > 0) {
+        log.info("COMBO", `auto-switch for [${[...required].join(",")}] drops [${dropped.join(", ")}]`);
+      }
+      const reordered = reorderByCapabilities(filtered, required);
+      if (reordered[0] !== filtered[0]) {
         log.info("COMBO", `auto-switch for [${[...required].join(",")}] → ${reordered[0]}`);
       }
       rotatedModels = reordered;
     }
   }
-  
+
   let lastError = null;
   let earliestRetryAfter = null;
   let lastStatus = null;

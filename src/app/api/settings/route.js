@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { getSettings, updateSettings } from "@/lib/localDb";
+import { normalizeBudgetSettings, normalizeComboStrategies } from "@/lib/db/repos/settingsRepo.js";
 import { applyOutboundProxyEnv } from "@/lib/network/outboundProxy";
 import { resetComboRotation } from "open-sse/services/combo.js";
 import bcrypt from "bcryptjs";
@@ -39,8 +40,24 @@ export async function PATCH(request) {
   try {
     const body = await request.json();
 
-    // Strip protected secrets before any internal handling sets them
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      return NextResponse.json({ error: "Settings payload must be an object" }, { status: 400 });
+    }
+
+    // Strip protected secrets before any internal handling sets them.
     for (const key of PROTECTED_SETTING_KEYS) delete body[key];
+
+    if (Object.prototype.hasOwnProperty.call(body, "budget")) {
+      const current = await getSettings();
+      body.budget = normalizeBudgetSettings(body.budget, current.budget);
+    }
+
+    // Per-combo strategy map, including the smart-routing opt-in. Validated here
+    // so a malformed or hostile value is rejected with 400 rather than stored.
+    if (Object.prototype.hasOwnProperty.call(body, "comboStrategies")) {
+      const current = await getSettings();
+      body.comboStrategies = normalizeComboStrategies(body.comboStrategies, current.comboStrategies);
+    }
 
     // If updating password, hash it
     if (body.newPassword) {
@@ -112,6 +129,9 @@ export async function PATCH(request) {
     safeSettings.oidcConfigured = !!(safeSettings.oidcIssuerUrl && safeSettings.oidcClientId && oidcClientSecret);
     return NextResponse.json(safeSettings, { headers: SETTINGS_RESPONSE_HEADERS });
   } catch (error) {
+    if (error instanceof TypeError) {
+      return NextResponse.json({ error: error.message }, { status: 400 });
+    }
     console.log("Error updating settings:", error);
     return NextResponse.json({ error: error.message }, { status: 500 });
   }

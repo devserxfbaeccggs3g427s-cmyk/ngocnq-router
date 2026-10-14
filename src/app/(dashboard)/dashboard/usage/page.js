@@ -5,6 +5,7 @@ import { useSearchParams, useRouter } from "next/navigation";
 import { RequestLogger, CardSkeleton, SegmentedControl } from "@/shared/components";
 import UsageStats from "@/shared/components/UsageStats";
 import RequestDetailsTab from "./components/RequestDetailsTab";
+import PhaseAOverview from "./components/PhaseAOverview";
 
 const PERIODS = [
   { value: "today", label: "Today" },
@@ -30,7 +31,7 @@ function UsageContent() {
   const [period, setPeriod] = useState("today");
 
   const tabFromUrl = searchParams.get("tab");
-  const activeTab = tabFromUrl && ["overview", "logs", "details"].includes(tabFromUrl)
+  const activeTab = tabFromUrl && ["overview", "analytics", "logs", "details"].includes(tabFromUrl)
     ? tabFromUrl
     : "overview";
 
@@ -48,6 +49,7 @@ function UsageContent() {
         <SegmentedControl
           options={[
             { value: "overview", label: "Overview" },
+            { value: "analytics", label: "Analytics" },
             { value: "details", label: "Details" },
           ]}
           value={activeTab}
@@ -70,6 +72,8 @@ function UsageContent() {
           <UsageStats period={period} setPeriod={setPeriod} hidePeriodSelector />
         </Suspense>
       )}
+      {/* Phase A: one UTC filter row driving KPIs, trend, breakdowns, budgets and traces. */}
+      {activeTab === "analytics" && <PhaseAOverview />}
       {activeTab === "logs" && <RequestLogger />}
       {activeTab === "details" && <RequestDetailsTab />}
     </div>

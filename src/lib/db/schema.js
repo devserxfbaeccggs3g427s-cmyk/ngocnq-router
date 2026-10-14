@@ -3,7 +3,7 @@
 // pre-change safety backup in migrate.js: when the stored version is lower,
 // one lightweight DB backup is taken before applying schema changes. Forgetting
 // to bump only skips that backup — it does NOT break the additive auto-sync.
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 5;
 
 export const PRAGMA_SQL = `
 PRAGMA journal_mode = WAL;
@@ -87,8 +87,14 @@ export const TABLES = {
       // syncSchemaFromTables() on boot; existing rows read as unrestricted (0).
       accessRestricted: "INTEGER DEFAULT 0",
       accessAllow: "TEXT",
+      // Project linkage (added in schema v3)
+      projectId: "TEXT",
+      projectLabel: "TEXT",
     },
-    indexes: ["CREATE INDEX IF NOT EXISTS idx_ak_key ON apiKeys(key)"],
+    indexes: [
+      "CREATE INDEX IF NOT EXISTS idx_ak_key ON apiKeys(key)",
+      "CREATE INDEX IF NOT EXISTS idx_ak_project ON apiKeys(projectId)",
+    ],
   },
   combos: {
     columns: {
@@ -121,16 +127,25 @@ export const TABLES = {
       endpoint: "TEXT",
       promptTokens: "INTEGER DEFAULT 0",
       completionTokens: "INTEGER DEFAULT 0",
-      cost: "REAL DEFAULT 0",
+      // NULL means pricing was unavailable. Explicit free usage is stored as 0.
+      cost: "REAL",
+      costStatus: "TEXT NOT NULL DEFAULT 'unknown'",
       status: "TEXT",
       tokens: "TEXT",
       meta: "TEXT",
+      // Phase A: stable attribution and attempt-level billing dedup.
+      apiKeyId: "TEXT",
+      projectId: "TEXT",
+      attemptId: "TEXT",
     },
     indexes: [
       "CREATE INDEX IF NOT EXISTS idx_uh_ts ON usageHistory(timestamp DESC)",
       "CREATE INDEX IF NOT EXISTS idx_uh_provider ON usageHistory(provider)",
       "CREATE INDEX IF NOT EXISTS idx_uh_model ON usageHistory(model)",
       "CREATE INDEX IF NOT EXISTS idx_uh_conn ON usageHistory(connectionId)",
+      "CREATE INDEX IF NOT EXISTS idx_uh_apikey_id ON usageHistory(apiKeyId)",
+      "CREATE INDEX IF NOT EXISTS idx_uh_project ON usageHistory(projectId)",
+      "CREATE UNIQUE INDEX IF NOT EXISTS idx_uh_attempt ON usageHistory(attemptId) WHERE attemptId IS NOT NULL",
     ],
   },
   usageDaily: {
@@ -154,6 +169,86 @@ export const TABLES = {
       "CREATE INDEX IF NOT EXISTS idx_rd_provider ON requestDetails(provider)",
       "CREATE INDEX IF NOT EXISTS idx_rd_model ON requestDetails(model)",
       "CREATE INDEX IF NOT EXISTS idx_rd_conn ON requestDetails(connectionId)",
+    ],
+  },
+  // Phase A: trace storage for smart routing
+  traces: {
+    columns: {
+      requestId: "TEXT PRIMARY KEY",
+      taskId: "TEXT",
+      agentLabel: "TEXT",
+      apiKeyId: "TEXT",
+      projectId: "TEXT",
+      requestedModel: "TEXT",
+      endpoint: "TEXT",
+      provider: "TEXT",
+      comboName: "TEXT",
+      accountId: "TEXT",
+      startTime: "TEXT NOT NULL",
+      endTime: "TEXT",
+      status: "TEXT NOT NULL DEFAULT 'pending'",
+      httpStatus: "INTEGER",
+      reason: "TEXT",
+      // NULL means at least one attempt has unknown cost, or none were charged.
+      cost: "REAL",
+      costStatus: "TEXT NOT NULL DEFAULT 'unknown'",
+      metricsJson: "TEXT",
+    },
+    indexes: [
+      "CREATE INDEX IF NOT EXISTS idx_traces_start ON traces(startTime DESC)",
+      "CREATE INDEX IF NOT EXISTS idx_traces_task ON traces(taskId)",
+      "CREATE INDEX IF NOT EXISTS idx_traces_provider ON traces(provider)",
+      "CREATE INDEX IF NOT EXISTS idx_traces_model ON traces(requestedModel)",
+      "CREATE INDEX IF NOT EXISTS idx_traces_status ON traces(status)",
+      "CREATE INDEX IF NOT EXISTS idx_traces_apikey ON traces(apiKeyId)",
+      "CREATE INDEX IF NOT EXISTS idx_traces_project ON traces(projectId)",
+    ],
+  },
+  traceAttempts: {
+    columns: {
+      attemptId: "TEXT PRIMARY KEY",
+      requestId: "TEXT NOT NULL",
+      provider: "TEXT NOT NULL",
+      model: "TEXT NOT NULL",
+      connectionId: "TEXT",
+      startTime: "TEXT NOT NULL",
+      endTime: "TEXT",
+      status: "TEXT NOT NULL DEFAULT 'running'",
+      httpStatus: "INTEGER",
+      ttftMs: "INTEGER",
+      durationMs: "INTEGER",
+      // No token counters here by design (v5). Numeric usage lives only in
+      // usageHistory, joined by attemptId; attempts keep provenance metadata.
+      tokenSource: "TEXT",
+      cost: "REAL",
+      costStatus: "TEXT NOT NULL DEFAULT 'unknown'",
+    },
+    indexes: [
+      "CREATE INDEX IF NOT EXISTS idx_ta_request ON traceAttempts(requestId)",
+      "CREATE INDEX IF NOT EXISTS idx_ta_provider ON traceAttempts(provider)",
+      "CREATE INDEX IF NOT EXISTS idx_ta_model ON traceAttempts(model)",
+      "CREATE INDEX IF NOT EXISTS idx_ta_conn ON traceAttempts(connectionId)",
+      "CREATE INDEX IF NOT EXISTS idx_ta_status ON traceAttempts(status)",
+    ],
+  },
+  // Phase A: budget alerts (unique per scope/period/threshold)
+  budgetAlerts: {
+    columns: {
+      id: "TEXT PRIMARY KEY",
+      scope: "TEXT NOT NULL",        // 'global' | 'project' | 'apiKey'
+      scopeId: "TEXT NOT NULL",      // projectId or apiKeyId or 'global'
+      periodType: "TEXT NOT NULL",   // 'daily' | 'monthly'
+      periodKey: "TEXT NOT NULL",    // UTC date key: '2026-10-12' or '2026-10'
+      threshold: "REAL NOT NULL",    // threshold ratio, e.g. 0.8 = 80%
+      // Defaults keep ALTER TABLE upgrade-safe; inserts always provide snapshots.
+      budgetUsd: "REAL NOT NULL DEFAULT 0",
+      currentCost: "REAL NOT NULL DEFAULT 0",
+      triggeredAt: "TEXT NOT NULL",
+      notifiedAt: "TEXT",
+    },
+    indexes: [
+      "CREATE UNIQUE INDEX IF NOT EXISTS idx_ba_unique ON budgetAlerts(scope, scopeId, periodType, periodKey, threshold)",
+      "CREATE INDEX IF NOT EXISTS idx_ba_triggered ON budgetAlerts(triggeredAt DESC)",
     ],
   },
 };

@@ -1,7 +1,11 @@
 "use client";
 
 import { useState, useEffect, useRef } from "react";
-import { getStatusVariant as getConnectionStatusVariant } from "@/shared/utils/connectionStatus";
+import {
+  formatQuotaStatus,
+  formatStatusCheckedAt,
+  getStatusVariant as getConnectionStatusVariant,
+} from "@/shared/utils/connectionStatus";
 import PropTypes from "prop-types";
 import { Badge, Toggle, Tooltip } from "@/shared/components";
 import CooldownTimer from "./CooldownTimer";
@@ -111,10 +115,15 @@ export default function ConnectionRow({ connection, proxyPools, isOAuth, isFirst
     };
   }, [modelLockUntil]);
 
-  // Determine effective status (override unavailable if cooldown expired)
-  const effectiveStatus = (connection.testStatus === "unavailable" && !isCooldown)
-    ? "active"  // Cooldown expired u2192 treat as active
-    : connection.testStatus;
+  const health = connection.health || null;
+  // Prefer the server-derived health state: it accounts for persisted rate limits,
+  // all model locks, stale cooldowns, and soft provider warnings consistently.
+  const effectiveStatus = health?.state || ((connection.testStatus === "unavailable" && !isCooldown)
+    ? "active"
+    : connection.testStatus);
+  const cooldownUntil = health?.cooldownUntil || modelLockUntil;
+  const quotaLabel = formatQuotaStatus(health?.quota);
+  const checkedLabel = formatStatusCheckedAt(health?.checkedAt || connection.lastTested);
 
   const getStatusVariant = () => getConnectionStatusVariant(connection.isActive, effectiveStatus);
 
@@ -165,20 +174,24 @@ export default function ConnectionRow({ connection, proxyPools, isOAuth, isFirst
           )}
           <div className="mt-1 flex min-w-0 flex-wrap items-center gap-1.5 sm:gap-2">
             <Badge variant={getStatusVariant()} size="sm" dot>
-              {connection.isActive === false ? "disabled" : (effectiveStatus || "Unknown")}
+              {connection.isActive === false ? "disabled" : (effectiveStatus || "unknown")}
             </Badge>
             <Badge variant="default" size="sm">
               {authLabel}
+            </Badge>
+            <span className="text-[11px] text-text-muted" title={checkedLabel}>{checkedLabel}</span>
+            <Badge variant={health?.quota?.status === "known" ? "success" : "default"} size="sm">
+              {quotaLabel}
             </Badge>
             {hasAnyProxy && (
               <Badge variant={proxyBadgeVariant} size="sm">
                 Proxy
               </Badge>
             )}
-            {isCooldown && connection.isActive !== false && <CooldownTimer until={modelLockUntil} />}
-            {connection.lastError && connection.isActive !== false && (
-              <span className="max-w-full truncate text-xs text-red-500 sm:max-w-[300px]" title={connection.lastError}>
-                {connection.lastError}
+            {cooldownUntil && connection.isActive !== false && <CooldownTimer until={cooldownUntil} />}
+            {(health?.lastError || connection.lastError) && connection.isActive !== false && (
+              <span className="max-w-full truncate text-xs text-red-500 sm:max-w-[300px]" title={health?.lastError || connection.lastError}>
+                {health?.lastError || connection.lastError}
               </span>
             )}
             <span className="text-xs text-text-muted">#{connection.priority}</span>
@@ -287,6 +300,17 @@ ConnectionRow.propTypes = {
     testStatus: PropTypes.string,
     isActive: PropTypes.bool,
     lastError: PropTypes.string,
+    lastTested: PropTypes.string,
+    health: PropTypes.shape({
+      state: PropTypes.string,
+      checkedAt: PropTypes.string,
+      lastError: PropTypes.string,
+      cooldownUntil: PropTypes.string,
+      quota: PropTypes.shape({
+        status: PropTypes.string,
+        remainingPercentage: PropTypes.number,
+      }),
+    }),
     priority: PropTypes.number,
     globalPriority: PropTypes.number,
   }).isRequired,

@@ -51,6 +51,12 @@ source/*
 .cursor/*
 docs/*
 !docs/ARCHITECTURE.md
+!docs/ROADMAP.md
+!docs/superpowers/
+docs/superpowers/*
+!docs/superpowers/specs/
+docs/superpowers/specs/*
+!docs/superpowers/specs/2026-10-13-phase-a/
 test/*
 open-sse/test/*
 RM.vn.md

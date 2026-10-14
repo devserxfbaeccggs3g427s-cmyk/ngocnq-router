@@ -32,6 +32,7 @@ import { stripUnsupportedModalities } from "../translator/concerns/modality.js";
 import { prefetchRemoteImages } from "../translator/concerns/prefetch.js";
 import { defaultClaudeToolType, shouldDefaultClaudeToolType } from "../translator/concerns/toolCall.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
+import { createAttemptTracer } from "./chatCore/attemptTrace.js";
 
 /**
  * Core chat handler - shared between SSE and Worker
@@ -60,7 +61,7 @@ export function stripContinuityFields(body) {
   return body;
 }
 
-export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, clientRawRequest, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, headroomTimeoutMs, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, pxpipeEnabled, pxpipeMinChars, pxpipeTimeoutMs, pxpipeTransform, onPxpipeEvent, sourceFormatOverride, providerThinking, providerOverrides }) {
+export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, clientRawRequest, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, headroomTimeoutMs, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, pxpipeEnabled, pxpipeMinChars, pxpipeTimeoutMs, pxpipeTransform, onPxpipeEvent, sourceFormatOverride, providerThinking, providerOverrides, trace, onTraceBegin, onTraceFinish, onTraceTerminal }) {
   const { provider, model } = modelInfo;
   const requestStartTime = Date.now();
   // Stable per-session color so all lines of one CLI conversation share a tag
@@ -328,8 +329,29 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   if (passthrough && clientTool === "claude") anchorClaudeCache(translatedBody);
 
   const executor = getExecutor(provider);
+  const tracer = createAttemptTracer({ trace, onTraceBegin, onTraceFinish, onTraceTerminal, provider, model, connectionId, log });
   trackPendingRequest(model, provider, connectionId, true);
-  appendRequestLog({ model, provider, connectionId, status: "PENDING" }).catch(() => { });
+  if (!tracer) appendRequestLog({ model, provider, connectionId, status: "PENDING" }).catch(() => { });
+  const appendUsageLog = (extra) => tracer ? Promise.resolve() : appendRequestLog({ model, provider, connectionId, ...extra }).catch(() => { });
+  let activeAttempt = null;
+  const executeTraced = async () => {
+    activeAttempt = await tracer?.begin() || null;
+    try {
+      return await executor.execute({
+        model, body: translatedBody, stream, credentials, providerSessionId: sessionSeed,
+        clientTool, signal: streamController.signal, log, proxyOptions, providerOverrides,
+      });
+    } catch (error) {
+      await activeAttempt?.finish({ status: error.name === "AbortError" ? "cancelled" : "error", httpStatus: error.name === "AbortError" ? 499 : 502, reason: error.name === "AbortError" ? "cancelled" : "upstream_error" });
+      throw error;
+    }
+  };
+  const finishResponseAttempt = async (response) => {
+    if (!activeAttempt) return;
+    if (!response.ok) {
+      await activeAttempt.finish({ status: "error", httpStatus: response.status, reason: response.status === 429 ? "rate_limit" : (response.status === 401 || response.status === 403 ? "auth_failed" : "upstream_error") });
+    }
+  };
 
   const msgCount = translatedBody.messages?.length || translatedBody.input?.length || translatedBody.contents?.length || translatedBody.request?.contents?.length || 0;
   log?.debug?.("REQUEST", `${provider.toUpperCase()} | ${model} | ${msgCount} msgs`);
@@ -382,18 +404,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   // exception: it is decoded by the executor into OpenAI-compatible output.
   let providerResponseFormat = targetFormat;
   try {
-    const result = await executor.execute({
-      model,
-      body: translatedBody,
-      stream,
-      credentials,
-      providerSessionId: sessionSeed,
-      clientTool,
-      signal: streamController.signal,
-      log,
-      proxyOptions,
-      providerOverrides,
-    });
+    const result = await executeTraced();
     providerResponse = result.response;
     providerUrl = result.url;
     providerHeaders = result.headers;
@@ -406,7 +417,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     reqLogger.logTargetRequest(providerUrl, providerHeaders, finalBody);
   } catch (error) {
     trackPendingRequest(model, provider, connectionId, false, true);
-    appendRequestLog({ model, provider, connectionId, status: `FAILED ${error.name === "AbortError" ? 499 : HTTP_STATUS.BAD_GATEWAY}` }).catch(() => { });
+    appendUsageLog({ status: `FAILED ${error.name === "AbortError" ? 499 : HTTP_STATUS.BAD_GATEWAY}` });
     saveRequestDetail(buildRequestDetail({
       provider, model, connectionId,
       latency: { ttft: 0, total: Date.now() - requestStartTime },
@@ -420,15 +431,19 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
 
     if (error.name === "AbortError") {
       streamController.handleError(error);
+      tracer?.terminal("cancelled", "cancelled");
       return createErrorResult(499, "Request aborted");
     }
     const errMsg = formatProviderError(error, provider, model, HTTP_STATUS.BAD_GATEWAY);
     if (log?.errorLine) {
       log.errorLine(reqTag, "✗", `ERROR 502 · ${provider}/${model} · ${Date.now() - requestStartTime}ms\n    ${errMsg}${error.stack ? `\n    ${error.stack}` : ""}`);
     }
+    tracer?.terminal("error", "upstream_error");
     return createErrorResult(HTTP_STATUS.BAD_GATEWAY, errMsg);
   }
 
+  // The first 401/403 is an actual upstream call, even when refresh later succeeds.
+  await finishResponseAttempt(providerResponse);
   // Handle 401/403 - try token refresh (skip for noAuth providers)
   if (!executor.noAuth && (providerResponse.status === HTTP_STATUS.UNAUTHORIZED || providerResponse.status === HTTP_STATUS.FORBIDDEN)) {
     try {
@@ -451,23 +466,12 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
           try { await onCredentialsRefreshed(newCredentials); } catch (e) { log?.warn?.("TOKEN", `onCredentialsRefreshed failed: ${e.message}`); }
         }
         try {
-          const retryResult = await executor.execute({
-            model,
-            body: translatedBody,
-            stream,
-            credentials,
-            providerSessionId: sessionSeed,
-            clientTool,
-            signal: streamController.signal,
-            log,
-            proxyOptions,
-            providerOverrides,
-          });
-          if (retryResult.response.ok) {
-            providerResponse = retryResult.response;
-            providerUrl = retryResult.url;
-            providerResponseFormat = retryResult.responseFormat || targetFormat;
-          }
+          const retryResult = await executeTraced();
+          await finishResponseAttempt(retryResult.response);
+          providerResponse = retryResult.response;
+          providerUrl = retryResult.url;
+          finalBody = retryResult.transformedBody;
+          providerResponseFormat = retryResult.responseFormat || targetFormat;
         } catch { log?.warn?.("TOKEN", `${provider.toUpperCase()} | retry after refresh failed`); }
       } else {
         log?.warn?.("TOKEN", `${provider.toUpperCase()} | refresh failed`);
@@ -481,7 +485,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   if (!providerResponse.ok) {
     trackPendingRequest(model, provider, connectionId, false, true);
     const { statusCode, message, resetsAtMs } = await parseUpstreamError(providerResponse, executor);
-    appendRequestLog({ model, provider, connectionId, status: `FAILED ${statusCode}` }).catch(() => { });
+    appendUsageLog({ status: `FAILED ${statusCode}` });
     saveRequestDetail(buildRequestDetail({
       provider, model, connectionId,
       latency: { ttft: 0, total: Date.now() - requestStartTime },
@@ -499,32 +503,100 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
       log.errorLine(reqTag, "✗", `ERROR ${statusCode} · ${provider}/${model} · ${Date.now() - requestStartTime}ms${urlStr}\n    ${errMsg}`);
     }
     reqLogger.logError(new Error(message), finalBody || translatedBody);
+    tracer?.terminal("error", providerResponse.status === 429 ? "rate_limit" : "upstream_error");
     return createErrorResult(statusCode, errMsg, resetsAtMs, upstreamResponseHeaders(providerResponse.headers));
   }
 
   const sharedCtx = { provider, model, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, pxpipe: pxpipeSummary, reqTag, log };
-  const appendLog = (extra) => appendRequestLog({ model, provider, connectionId, ...extra }).catch(() => { });
+  const appendLog = appendUsageLog;
   const trackDone = () => trackPendingRequest(model, provider, connectionId, false);
 
   // Provider forced streaming but client wants JSON. The Responses wire always
   // streams upstream (openaiToOpenAIResponsesRequest pins stream:true), so a
   // non-stream OpenAI/native client behind a Responses upstream must also take
   // this path — handleForcedSSEToJson returns null when the body is not SSE.
-  if (!clientRequestedStreaming && (providerRequiresStreaming || providerResponseFormat === FORMATS.OPENAI_RESPONSES)) {
-    const result = await handleForcedSSEToJson({ ...sharedCtx, providerResponse, sourceFormat, targetFormat: providerResponseFormat, customToolNames, toolNameMap, trackDone, appendLog });
-    if (result) { streamController.handleComplete(); return result; }
-  }
+  try {
+    if (!clientRequestedStreaming && (providerRequiresStreaming || providerResponseFormat === FORMATS.OPENAI_RESPONSES)) {
+      const result = await handleForcedSSEToJson({ ...sharedCtx, providerResponse, sourceFormat, targetFormat: providerResponseFormat, customToolNames, toolNameMap, trackDone, appendLog, traced: !!tracer });
+      if (result) {
+        await activeAttempt?.finish({ status: result.success ? "success" : "error", httpStatus: result.success ? providerResponse.status : result.status, usage: result.usage, tokenSource: result.tokenSource, ttftAt: Date.now() });
+        if (!result.success) tracer?.terminal("error", "upstream_error");
+        streamController.handleComplete();
+        return result;
+      }
+    }
 
-  // True non-streaming response
-  if (!stream) {
-    const result = await handleNonStreamingResponse({ ...sharedCtx, providerResponse, sourceFormat, targetFormat: providerResponseFormat, reqLogger, toolNameMap, customToolNames, trackDone, appendLog });
-    streamController.handleComplete();
-    return result;
+    // True non-streaming response
+    if (!stream) {
+      const result = await handleNonStreamingResponse({ ...sharedCtx, providerResponse, sourceFormat, targetFormat: providerResponseFormat, reqLogger, toolNameMap, customToolNames, trackDone, appendLog, traced: !!tracer });
+      await activeAttempt?.finish({ status: result.success ? "success" : "error", httpStatus: result.success ? providerResponse.status : result.status, usage: result.usage, tokenSource: result.tokenSource, ttftAt: Date.now() });
+      if (!result.success) tracer?.terminal("error", "upstream_error");
+      streamController.handleComplete();
+      return result;
+    }
+  } catch (error) {
+    await activeAttempt?.finish({ status: "error", httpStatus: 502 });
+    tracer?.terminal("error", "upstream_error");
+    throw error;
   }
 
   // Streaming response
-  const { onStreamComplete, streamDetailId } = buildOnStreamComplete({ ...sharedCtx });
-  return handleStreamingResponse({ ...sharedCtx, providerResponse, sourceFormat, targetFormat: providerResponseFormat, userAgent, reqLogger, toolNameMap, customToolNames, streamController, onStreamComplete, streamDetailId, credentials });
+  let streamUsage = null;
+  let streamSource = "unknown";
+  let ttftAt = null;
+  let failed = false;
+  const { onStreamComplete: saveStreamDetail, streamDetailId } = buildOnStreamComplete({ ...sharedCtx, traced: !!tracer });
+  const onStreamComplete = (content, usage, firstChunkAt, outcome) => {
+    streamUsage = usage;
+    streamSource = usage ? (usage.estimated ? "estimated" : "upstream") : "unknown";
+    ttftAt = firstChunkAt;
+    if (outcome === "error") failed = true;
+    saveStreamDetail(content, usage, firstChunkAt);
+  };
+  let result;
+  try {
+    result = await handleStreamingResponse({ ...sharedCtx, providerResponse, sourceFormat, targetFormat: providerResponseFormat, userAgent, reqLogger, toolNameMap, customToolNames, streamController, onStreamComplete, streamDetailId, credentials, traced: !!tracer, onStreamFailure: () => { failed = true; } });
+  } catch (error) {
+    await activeAttempt?.finish({ status: "error", httpStatus: 502 });
+    tracer?.terminal("error", "upstream_error");
+    throw error;
+  }
+  if (!result.success) {
+    await activeAttempt?.finish({ status: "error", httpStatus: result.status || result.response?.status || 502, reason: "upstream_error" });
+    tracer?.terminal("error", "upstream_error");
+    return result;
+  }
+  if (!activeAttempt) return result;
+  const attempt = activeAttempt;
+  const original = result.response;
+  const reader = original.body.getReader();
+  const completeStream = async (status, reason) => {
+    await attempt.finish({ status, httpStatus: status === "success" ? providerResponse.status : 502,
+      ttftAt, usage: streamUsage, tokenSource: streamSource, reason });
+    if (status !== "success") tracer?.terminal(status, reason);
+  };
+  // Let upstream usage processing finish before parent response EOF is exposed.
+  const responseBody = new ReadableStream({
+    async pull(controller) {
+      try {
+        const { done, value } = await reader.read();
+        if (done) {
+          await completeStream(failed ? "error" : "success", failed ? "upstream_error" : null);
+          controller.close();
+          return;
+        }
+        ttftAt ||= Date.now();
+        controller.enqueue(value);
+      } catch (error) {
+        await completeStream("error", "upstream_error");
+        controller.error(error);
+      }
+    },
+    async cancel(reason) {
+      try { await reader.cancel(reason); } finally { await completeStream("cancelled", "cancelled"); }
+    },
+  });
+  return { ...result, response: new Response(responseBody, { status: original.status, statusText: original.statusText, headers: original.headers }) };
 }
 
 export function isTokenExpiringSoon(expiresAt, bufferMs = 5 * 60 * 1000) {

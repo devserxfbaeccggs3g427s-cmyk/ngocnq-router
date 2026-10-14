@@ -892,12 +892,14 @@ export async function testSingleConnection(id) {
     const proxyResult = await testProxyUrl({ proxyUrl: effectiveProxy.connectionProxyUrl });
     if (!proxyResult.ok) {
       const proxyError = proxyResult.error || `Proxy test failed with status ${proxyResult.status}`;
+      const testedAt = new Date().toISOString();
       await updateProviderConnection(id, {
         testStatus: "error",
+        lastTested: testedAt,
         lastError: proxyError,
-        lastErrorAt: new Date().toISOString(),
+        lastErrorAt: testedAt,
       });
-      return { valid: false, error: proxyError, latencyMs: 0, testedAt: new Date().toISOString() };
+      return { valid: false, error: proxyError, latencyMs: 0, testedAt };
     }
   }
 
@@ -916,14 +918,16 @@ export async function testSingleConnection(id) {
   // out of credits. Keep testStatus active; surface the message as lastError so the
   // dashboard can show a warning without marking the connection broken.
   const softWarning = result.valid && (result.warning || result.error);
+  const testedAt = new Date().toISOString();
   const updateData = {
     testStatus: result.valid ? "active" : "error",
+    lastTested: testedAt,
     lastError: result.valid ? (softWarning || null) : result.error,
     lastErrorAt: result.valid
       ? softWarning
-        ? new Date().toISOString()
+        ? testedAt
         : null
-      : new Date().toISOString(),
+      : testedAt,
   };
 
   if (result.refreshed && result.newTokens) {
@@ -947,5 +951,5 @@ export async function testSingleConnection(id) {
 
   await updateProviderConnection(id, updateData);
 
-  return { valid: result.valid, error: result.error, refreshed: !!result.refreshed, latencyMs, testedAt: new Date().toISOString() };
+  return { valid: result.valid, error: result.error, refreshed: !!result.refreshed, latencyMs, testedAt };
 }

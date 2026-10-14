@@ -26,8 +26,15 @@ const engine = await import("../../src/sse/services/keyAccess.js");
 const helpers = await import("../../src/shared/utils/keyAccess.js");
 const { keyAccessDeniedMessage, KEY_ACCESS_MAX_ENTRIES } = await import("../../src/shared/constants/keyAccess.js");
 
-function key(id, access) {
-  fx.keys[`sk-${id}`] = { id, name: `key-${id}`, isActive: true, access };
+function key(id, access, project = {}) {
+  fx.keys[`sk-${id}`] = {
+    id,
+    name: `key-${id}`,
+    isActive: true,
+    access,
+    projectId: project.projectId || null,
+    projectLabel: project.projectLabel || null,
+  };
 }
 const req = (k, { header = "Authorization", query = false } = {}) => {
   const headers = {};
@@ -53,10 +60,15 @@ beforeEach(() => {
 });
 
 describe("unrestricted passthrough", () => {
-  it("no key, unknown key and unrestricted key all yield no context (today's behaviour)", async () => {
+  it("keeps configured key identity while leaving access unrestricted", async () => {
     expect(await ctxFor(null)).toBeNull();
     expect(await ctxFor("sk-nope")).toBeNull();
-    expect(await ctxFor("sk-open")).toBeNull();
+    expect(await ctxFor("sk-open")).toMatchObject({
+      keyId: "open",
+      keyName: "key-open",
+      restricted: false,
+      projectId: null,
+    });
     for (const m of ["Main", "openai/model-a", "fast", "anything/at-all"]) {
       expect(await status("sk-open", m)).toBe(200);
     }

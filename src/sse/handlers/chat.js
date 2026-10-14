@@ -16,7 +16,8 @@ import { getTransform as getPxpipeTransform } from "@/lib/pxpipe/loader.js";
 import { appendPxpipeEvent } from "@/lib/pxpipe/events.js";
 import { errorResponse, unavailableResponse } from "open-sse/utils/error.js";
 import { upstreamResponseHeaders } from "open-sse/utils/upstreamHeaders.js";
-import { handleComboChat, handleFusionChat, detectRequiredCapabilities } from "open-sse/services/combo.js";
+import { handleComboChat, handleFusionChat, detectRequiredCapabilities, rankSmartComboCandidates, SMART_ROUTING_POLICY_VERSION } from "open-sse/services/combo.js";
+import { getRoutingMetrics } from "@/lib/db/repos/traceRepo.js";
 import { augmentModelsWithCapacityAdapter, withCapacityAdapterStripping, getActiveAdapterStrategy } from "open-sse/services/capacityAdapter.js";
 import { handleBypassRequest } from "open-sse/utils/bypassHandler.js";
 import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
@@ -26,6 +27,7 @@ import { updateProviderCredentials, checkAndRefreshToken } from "../services/tok
 import { getProjectIdForConnection } from "open-sse/services/projectId.js";
 import { stripModelContextMarker } from "open-sse/utils/modelMarkers.js";
 import { getKeyAccessContext, enforceKeyAccess, filterAdapterModels } from "../services/keyAccess.js";
+import { createTraceCoordinator } from "../utils/traceCoordinator.js";
 
 /**
  * Handle chat completion request
@@ -99,21 +101,76 @@ export async function handleChat(request, clientRawRequest = null) {
   const bypassResponse = handleBypassRequest(body, modelStr, userAgent, !!settings.ccFilterNaming);
   if (bypassResponse) return bypassResponse.response || bypassResponse;
 
+  // Phase A parent trace. Created only now — after auth and the per-key
+  // allow-list — so a rejected request leaves no trace behind at all.
+  const traceCtx = await createTraceCoordinator({
+    request,
+    requestedModel: modelStr,
+    keyAccess,
+  });
+
   const requiredCapabilities = detectRequiredCapabilities(body);
 
   // Check if model is a combo (has multiple models with fallback)
   const comboModels = await getComboModels(modelStr);
   if (comboModels) {
+    await traceCtx.noteRouting({ comboName: modelStr });
+
     // Check for combo-specific strategy first, fallback to global
     const comboStrategies = settings.comboStrategies || {};
     const comboSpecificStrategy = comboStrategies[modelStr]?.fallbackStrategy;
     const comboStrategy = comboSpecificStrategy || settings.comboStrategy || "fallback";
+
+    // First apply capacity adapter for missing capabilities
     const augmentedModels = await filterAdapterModels(keyAccess, augmentModelsWithCapacityAdapter(comboModels, requiredCapabilities, settings), comboModels);
     const adapterAdded = augmentedModels.filter((m) => !comboModels.includes(m));
 
+    let finalModels = augmentedModels;
+    let routingMetrics = null;
+    // Smart routing is opt-in per combo (SR-01): a combo only reorders when its own
+    // strategy is "fallback" AND its entry sets smartRoutingEnabled. The global
+    // switch alone no longer changes dispatch order.
+    if (comboStrategy === "fallback" && comboStrategies[modelStr]?.smartRoutingEnabled === true) {
+      try {
+        routingMetrics = await getRoutingMetrics({ models: comboModels });
+        // Rank the DECLARED members only: an adapter model appended by the gateway
+        // was never chosen by the operator and has no routing history.
+        finalModels = rankSmartComboCandidates({
+          models: comboModels,
+          requiredCapabilities,
+          metrics: routingMetrics
+        });
+        const keptAdapter = finalModels.filter((m) => !comboModels.includes(m));
+        finalModels = [...finalModels, ...keptAdapter];
+        await traceCtx.noteRouting({
+          metrics: {
+            policyVersion: SMART_ROUTING_POLICY_VERSION,
+            smartApplied: true,
+            eligibleModels: comboModels.slice(0, 32),
+          },
+        });
+      } catch (e) {
+        if (e?.code === "unsupported_modality") {
+          await traceCtx.finish("error", HTTP_STATUS.BAD_REQUEST, "invalid_request");
+          return traceCtx.wrap(errorResponse(
+            HTTP_STATUS.BAD_REQUEST,
+            e.message,
+            { "X-9Router-Error-Code": "unsupported_modality" }
+          ));
+        }
+        // Metric lookup or ranking failure must never fail inference — keep the
+        // operator's declared order and record why.
+        log.warn("CHAT", `Smart routing: ${e.message}; using combo order`);
+        finalModels = augmentedModels;
+        await traceCtx.noteRouting({
+          metrics: { policyVersion: SMART_ROUTING_POLICY_VERSION, smartApplied: false, fallbackReason: "ranking_error" },
+        });
+      }
+    }
+
     if (comboStrategy === "fusion") {
       log.info("CHAT", `Combo "${modelStr}" with ${comboModels.length} models (strategy: fusion)`);
-      return handleFusionChat({
+      return traceCtx.wrap(await handleFusionChat({
         body,
         models: comboModels,
         handleSingleModel: (b, m, isPanel) => {
@@ -122,29 +179,31 @@ export async function handleChat(request, clientRawRequest = null) {
             const { tools, tool_choice, ...cleanBody } = clientRawRequest.body || {};
             cleanRawReq = { ...clientRawRequest, body: cleanBody };
           }
-          return handleSingleModelChat(b, m, cleanRawReq, request, apiKey);
+          return handleSingleModelChat(b, m, cleanRawReq, request, apiKey, null, traceCtx);
         },
         log,
         comboName: modelStr,
         judgeModel: comboStrategies[modelStr]?.judgeModel,
         tuning: comboStrategies[modelStr]?.fusionTuning,
-      });
+      }));
     }
 
     const comboStickyLimit = settings.comboStickyRoundRobinLimit;
-    log.info("CHAT", `Combo "${modelStr}" with ${augmentedModels.length} models (strategy: ${comboStrategy}, sticky: ${comboStickyLimit})`);
-    return handleComboChat({
+    log.info("CHAT", `Combo "${modelStr}" with ${finalModels.length} models (strategy: ${comboStrategy}, sticky: ${comboStickyLimit})`);
+    return traceCtx.wrap(await handleComboChat({
       body,
-      models: augmentedModels,
+      models: finalModels,
       handleSingleModel: withCapacityAdapterStripping(
-        (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey),
+        (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey, null, traceCtx),
         adapterAdded
       ),
       log,
       comboName: modelStr,
       comboStrategy,
-      comboStickyLimit
-    });
+      comboStickyLimit,
+      requiredCapabilities,
+      routingMetrics
+    }));
   }
 
   // Single model request — may still switch to a capacity-adapter model if the
@@ -153,26 +212,30 @@ export async function handleChat(request, clientRawRequest = null) {
   if (soloAugmented.length > 1) {
     const adapterAdded = soloAugmented.filter((m) => m !== modelStr);
     log.info("CHAT", `Capacity adapter for [${[...requiredCapabilities].join(",")}] on "${modelStr}" → trying ${soloAugmented.join(", ")}`);
-    return handleComboChat({
+    return traceCtx.wrap(await handleComboChat({
       body,
       models: soloAugmented,
       handleSingleModel: withCapacityAdapterStripping(
-        (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey),
+        (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey, null, traceCtx),
         adapterAdded
       ),
       log,
       comboName: modelStr,
       comboStrategy: getActiveAdapterStrategy(requiredCapabilities, settings)
-    });
+    }));
   }
 
-  return handleSingleModelChat(body, modelStr, clientRawRequest, request, apiKey, contextMarker ? `${modelStr.slice(modelStr.indexOf("/") + 1)}[${contextMarker}]` : null);
+  return traceCtx.wrap(await handleSingleModelChat(
+    body, modelStr, clientRawRequest, request, apiKey,
+    contextMarker ? `${modelStr.slice(modelStr.indexOf("/") + 1)}[${contextMarker}]` : null,
+    traceCtx
+  ));
 }
 
 /**
  * Handle single model chat request
  */
-async function handleSingleModelChat(body, modelStr, clientRawRequest = null, request = null, apiKey = null, requestedModel = null) {
+async function handleSingleModelChat(body, modelStr, clientRawRequest = null, request = null, apiKey = null, requestedModel = null, traceCtx = null) {
   const modelInfo = await getModelInfo(modelStr);
 
   // If provider is null, this might be a combo name - check and handle
@@ -191,6 +254,32 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       const augmentedModels = await filterAdapterModels(keyAccess, augmentModelsWithCapacityAdapter(comboModels, requiredCapabilities, chatSettings), comboModels);
       const adapterAdded = augmentedModels.filter((m) => !comboModels.includes(m));
 
+      // Same per-combo opt-in as the top-level combo (SR-01): the global switch is
+      // not enough on its own.
+      let finalModels = augmentedModels;
+      let routingMetrics = null;
+      if (comboStrategy === "fallback" && comboStrategies[modelStr]?.smartRoutingEnabled === true) {
+        try {
+          routingMetrics = await getRoutingMetrics({ models: comboModels });
+          finalModels = rankSmartComboCandidates({
+            models: comboModels,
+            requiredCapabilities,
+            metrics: routingMetrics
+          });
+          finalModels = [...finalModels, ...finalModels.filter((m) => !comboModels.includes(m))];
+        } catch (e) {
+          if (e?.code === "unsupported_modality") {
+            return errorResponse(
+              HTTP_STATUS.BAD_REQUEST,
+              e.message,
+              { "X-9Router-Error-Code": "unsupported_modality" }
+            );
+          }
+          log.warn("CHAT", `Smart routing: ${e.message}; using combo order`);
+          finalModels = augmentedModels;
+        }
+      }
+
       if (comboStrategy === "fusion") {
         log.info("CHAT", `Combo "${modelStr}" with ${comboModels.length} models (strategy: fusion)`);
         return handleFusionChat({
@@ -202,7 +291,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
               const { tools, tool_choice, ...cleanBody } = clientRawRequest.body || {};
               cleanRawReq = { ...clientRawRequest, body: cleanBody };
             }
-            return handleSingleModelChat(b, m, cleanRawReq, request, apiKey);
+            return handleSingleModelChat(b, m, cleanRawReq, request, apiKey, null, traceCtx);
           },
           log,
           comboName: modelStr,
@@ -212,18 +301,20 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       }
 
       const comboStickyLimit = chatSettings.comboStickyRoundRobinLimit;
-      log.info("CHAT", `Combo "${modelStr}" with ${augmentedModels.length} models (strategy: ${comboStrategy}, sticky: ${comboStickyLimit})`);
+      log.info("CHAT", `Combo "${modelStr}" with ${finalModels.length} models (strategy: ${comboStrategy}, sticky: ${comboStickyLimit})`);
       return handleComboChat({
         body,
-        models: augmentedModels,
+        models: finalModels,
         handleSingleModel: withCapacityAdapterStripping(
-          (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey),
+          (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey, null, traceCtx),
           adapterAdded
         ),
         log,
         comboName: modelStr,
         comboStrategy,
-        comboStickyLimit
+        comboStickyLimit,
+        requiredCapabilities,
+        routingMetrics
       });
     }
     log.warn("CHAT", "Invalid model format", { model: modelStr });
@@ -231,6 +322,9 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
   }
 
   const { provider, model } = modelInfo;
+  // Record the resolved target on the parent trace. Metadata only — a provider id,
+  // never credentials, headers or account labels.
+  await traceCtx?.noteRouting({ provider });
 
   // Routing shown in the unified "▶" line (client model → provider/model)
 
@@ -264,6 +358,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
 
     // Account selection shown in the unified "▶" line (acc:...)
     const refreshedCredentials = await checkAndRefreshToken(provider, credentials);
+    await traceCtx?.noteRouting({ provider, accountId: credentials.connectionId });
 
     // Ensure real project ID is available for providers that need it (P0 fix: cold miss)
     if ((provider === "antigravity" || provider === "gemini-cli") && !refreshedCredentials.projectId) {
@@ -304,6 +399,12 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       pxpipeTransform: chatSettings.pxpipeEnabled ? await getPxpipeTransform() : null,
       onPxpipeEvent: appendPxpipeEvent,
       providerThinking,
+      // Phase A tracing: open-sse owns one child attempt per dispatch; the app
+      // layer owns the parent via these callbacks.
+      trace: traceCtx?.enabled ? { requestId: traceCtx.requestId } : null,
+      onTraceBegin: traceCtx?.enabled ? traceCtx.onTraceBegin : null,
+      onTraceFinish: traceCtx?.enabled ? traceCtx.onTraceFinish : null,
+      onTraceTerminal: traceCtx?.enabled ? traceCtx.onTraceTerminal : null,
       // Per-provider user overrides (custom headers / connect timeout) from settings
       providerOverrides: (chatSettings.providerOverrides || {})[provider] || null,
       // Detect source format by endpoint + body

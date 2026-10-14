@@ -62,20 +62,23 @@ export function extractClientApiKey(request) {
 }
 
 /**
- * Access context for the request's key, or null when the request is
- * unrestricted (no key, unknown key, or a key whose access is unrestricted).
- * Keys are only authenticated elsewhere (middleware / requireApiKey); this only
- * decides what an identified key may call.
+ * Identity + access context for the request's key, or null when no configured
+ * key is presented. Keys are authenticated elsewhere (middleware /
+ * requireApiKey); this object keeps trusted key/project attribution even when
+ * access is unrestricted.
  */
 export async function getKeyAccessContext(request) {
   const apiKey = extractClientApiKey(request);
   if (!apiKey) return null;
   const record = await getApiKeyByKey(apiKey);
-  if (!record?.access?.restricted) return null;
+  if (!record) return null;
   return {
     keyId: record.id,
     keyName: record.name || record.id,
-    allow: record.access.allow || [],
+    projectId: record.projectId || null,
+    projectLabel: record.projectLabel || null,
+    restricted: record.access?.restricted === true,
+    allow: record.access?.allow || [],
     _sets: null,
   };
 }
@@ -121,7 +124,7 @@ export function keyAccessDeniedResponse(ctx, requested) {
  * @returns {Promise<Response|null>} a 403 Response, or null when allowed.
  */
 export async function enforceKeyAccess(ctx, requested) {
-  if (!ctx) return null;
+  if (!ctx?.restricted) return null;
   if (typeof requested !== "string" || !requested) return keyAccessDeniedResponse(ctx, String(requested ?? ""));
   const sets = await getAllowSets(ctx);
   const comboModels = await getComboModels(requested);
@@ -138,7 +141,7 @@ export async function enforceKeyAccess(ctx, requested) {
  * an unverifiable target is not an allowed one.
  */
 export async function enforceKeyAccessResolved(ctx, requested, provider, model) {
-  if (!ctx) return null;
+  if (!ctx?.restricted) return null;
   const label = requested || (provider ? `${provider}/${model ?? ""}` : "");
   if (!provider || !model) return keyAccessDeniedResponse(ctx, label);
   const sets = await getAllowSets(ctx);
@@ -150,7 +153,7 @@ export async function enforceKeyAccessResolved(ctx, requested, provider, model) 
  * @param {string[]|null} comboModels - routing's own combo resolution for `requested`
  */
 export async function enforceKeyAccessProvider(ctx, requested, comboModels) {
-  if (!ctx) return null;
+  if (!ctx?.restricted) return null;
   if (typeof requested !== "string" || !requested) return keyAccessDeniedResponse(ctx, String(requested ?? ""));
   const sets = await getAllowSets(ctx);
   const allowed = comboModels
@@ -166,7 +169,7 @@ export async function enforceKeyAccessProvider(ctx, requested, comboModels) {
  * model just shortens the fallback list, so combo failover is unaffected.
  */
 export async function filterAdapterModels(ctx, augmented, original) {
-  if (!ctx || !Array.isArray(augmented)) return augmented;
+  if (!ctx?.restricted || !Array.isArray(augmented)) return augmented;
   const keep = new Set(original || []);
   const out = [];
   for (const m of augmented) {
@@ -178,7 +181,7 @@ export async function filterAdapterModels(ctx, augmented, original) {
 
 /** /v1/models: a restricted key sees only the combos and models it may call. */
 export async function filterModelsListForKey(ctx, list) {
-  if (!ctx || !Array.isArray(list)) return list;
+  if (!ctx?.restricted || !Array.isArray(list)) return list;
   const sets = await getAllowSets(ctx);
   const out = [];
   for (const entry of list) {

@@ -55,7 +55,8 @@ export function createSSEStream(options = {}) {
     body = null,
     onStreamComplete = null,
     apiKey = null,
-    credentials = null
+    credentials = null,
+    onStreamFailure = null
   } = options;
 
   let buffer = "";
@@ -88,6 +89,13 @@ export function createSSEStream(options = {}) {
   let openAIResponsesDoneSent = false;
   let streamDoneSent = false;  // track duplicate [DONE] across transform + flush
   let finalized = false;
+  let streamFailed = false;
+  let usageEstimated = false;
+  const markStreamFailed = () => {
+    if (streamFailed) return;
+    streamFailed = true;
+    onStreamFailure?.();
+  };
   let completionFlushTimer = null;
 
   // Usage/logging tail, callable from transform() as well as flush(): a client that
@@ -102,8 +110,10 @@ export function createSSEStream(options = {}) {
 
     if (!hasValidUsage(finalUsage) && totalContentLength > 0) {
       finalUsage = estimateUsage(body, totalContentLength, isPassthrough ? FORMATS.OPENAI : sourceFormat);
+      usageEstimated = true;
       if (isPassthrough) usage = finalUsage; else state.usage = finalUsage;
     }
+    if (finalUsage && usageEstimated && !finalUsage.estimated) finalUsage = { ...finalUsage, estimated: true };
 
     if (hasValidUsage(finalUsage)) {
       logUsage(isPassthrough ? provider : (state?.provider || targetFormat), finalUsage, model, connectionId, apiKey);
@@ -115,7 +125,7 @@ export function createSSEStream(options = {}) {
       onStreamComplete({
         content: accumulatedContent,
         thinking: accumulatedThinking
-      }, finalUsage, ttftAt);
+      }, hasValidUsage(finalUsage) ? finalUsage : null, ttftAt, streamFailed ? "error" : "success");
     }
   };
 
@@ -224,9 +234,12 @@ export function createSSEStream(options = {}) {
               const extracted = extractUsage(parsed);
               if (extracted) {
                 usage = mergeUsage(usage, extracted);
+                usageEstimated = false;
               }
 
               responsesTerminal = isOpenAIResponsesTerminalEvent(currentOpenAIResponsesEvent, parsed);
+              if (parsed.error || currentOpenAIResponsesEvent === "response.failed" || parsed.type === "response.failed") markStreamFailed();
+              if (parsed?.choices?.[0]?.finish_reason === "error") markStreamFailed();
 
               const isFinishChunk = parsed.choices?.[0]?.finish_reason;
               if (isFinishChunk && !hasValidUsage(parsed.usage)) {
@@ -234,6 +247,7 @@ export function createSSEStream(options = {}) {
                 parsed.usage = filterUsageForFormat(estimated, FORMATS.OPENAI);
                 output = `data: ${JSON.stringify(parsed)}\n`;
                 usage = estimated;
+                usageEstimated = true;
                 injectedUsage = true;
               } else if (isFinishChunk && usage) {
                 const buffered = addBufferToUsage(usage);
@@ -283,6 +297,7 @@ export function createSSEStream(options = {}) {
         if (isOpenAIResponsesStream && isOpenAIResponsesTerminalEvent(openAIResponsesEventName, parsed)) {
           openAIResponsesTerminalSeen = true;
         }
+        if (parsed.error || openAIResponsesEventName === "response.failed" || parsed.type === "response.failed" || parsed?.choices?.[0]?.finish_reason === "error") markStreamFailed();
 
         // For Ollama: done=true is the final chunk with finish_reason/usage, must translate
         // For other formats: done=true is the [DONE] sentinel, skip
@@ -297,6 +312,7 @@ export function createSSEStream(options = {}) {
 
           // Synthesize response.failed if the Responses stream never sent a terminal event
           if (keepsOpenAIResponsesFormat && !openAIResponsesTerminalSeen) {
+            markStreamFailed();
             const failedOutput = formatIncompleteOpenAIResponsesStreamFailure();
             reqLogger?.appendConvertedChunk?.(failedOutput);
             controller.enqueue(sharedEncoder.encode(failedOutput));
@@ -353,7 +369,10 @@ export function createSSEStream(options = {}) {
 
         // Extract usage
         const extracted = extractUsage(parsed);
-        if (extracted) state.usage = mergeUsage(state.usage, extracted); // Keep original usage for logging
+        if (extracted) {
+          state.usage = mergeUsage(state.usage, extracted); // Keep original usage for logging
+          usageEstimated = false;
+        }
 
         // Responses same-format passthrough: re-emit with original event framing
         if (keepsOpenAIResponsesFormat && openAIResponsesEventName) {
@@ -394,6 +413,7 @@ export function createSSEStream(options = {}) {
               const estimated = estimateUsage(body, totalContentLength, sourceFormat);
               item.usage = filterUsageForFormat(estimated, sourceFormat); // Filter + already has buffer
               state.usage = estimated;
+              usageEstimated = true;
             } else if (state.finishReason && isFinishChunk && state.usage) {
               // Add buffer and filter usage for client (but keep original in state.usage for logging)
               const buffered = addBufferToUsage(state.usage);
@@ -469,7 +489,10 @@ export function createSSEStream(options = {}) {
             // Same accumulation the transform loop does, so finalizeStream() can
             // log a tail chunk's tokens instead of falling back to null.
             const extracted = extractUsage(parsed);
-            if (extracted) state.usage = mergeUsage(state.usage, extracted);
+            if (extracted) {
+              state.usage = mergeUsage(state.usage, extracted);
+              usageEstimated = false;
+            }
 
             const translated = translateResponse(targetFormat, sourceFormat, parsed, state);
 
@@ -535,7 +558,7 @@ export function createSSEStream(options = {}) {
   });
 }
 
-export function createSSETransformStreamWithLogger(targetFormat, sourceFormat, provider = null, reqLogger = null, toolNameMap = null, model = null, connectionId = null, body = null, onStreamComplete = null, apiKey = null, customToolNames = null, credentials = null) {
+export function createSSETransformStreamWithLogger(targetFormat, sourceFormat, provider = null, reqLogger = null, toolNameMap = null, model = null, connectionId = null, body = null, onStreamComplete = null, apiKey = null, customToolNames = null, credentials = null, onStreamFailure = null) {
   return createSSEStream({
     mode: STREAM_MODE.TRANSLATE,
     targetFormat,
@@ -549,11 +572,12 @@ export function createSSETransformStreamWithLogger(targetFormat, sourceFormat, p
     body,
     onStreamComplete,
     apiKey,
-    credentials
+    credentials,
+    onStreamFailure
   });
 }
 
-export function createPassthroughStreamWithLogger(provider = null, reqLogger = null, model = null, connectionId = null, body = null, onStreamComplete = null, apiKey = null) {
+export function createPassthroughStreamWithLogger(provider = null, reqLogger = null, model = null, connectionId = null, body = null, onStreamComplete = null, apiKey = null, onStreamFailure = null) {
   return createSSEStream({
     mode: STREAM_MODE.PASSTHROUGH,
     provider,
@@ -562,6 +586,7 @@ export function createPassthroughStreamWithLogger(provider = null, reqLogger = n
     connectionId,
     body,
     onStreamComplete,
-    apiKey
+    apiKey,
+    onStreamFailure
   });
 }
